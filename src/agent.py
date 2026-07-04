@@ -1,4 +1,5 @@
 import logging
+import os
 import textwrap
 
 from dotenv import load_dotenv
@@ -14,7 +15,12 @@ from livekit.agents import (
 )
 from livekit.plugins import ai_coustics, silero, google, groq, langchain
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from livekit.agents.voice.avatar import DataStreamAudioOutput
 from graph import create_workflow
+from requests import session
+from livekit import agents
+from livekit.agents import AgentServer, AgentSession
+from livekit.plugins import simli
 
 logger = logging.getLogger("agent")
 
@@ -25,8 +31,7 @@ class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
             # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-            # See all available models at https://docs.livekit.io/agents/models/llm/
-            llm=inference.LLM(model="google/gemini-2.5-flash"),
+            # See all available models at https://docs.livekit.io/agents/models/llm
             # To use a realtime model instead of a voice pipeline, replace the LLM
             # with a RealtimeModel and remove the STT/TTS from the AgentSession
             # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/)
@@ -36,11 +41,11 @@ class Assistant(Agent):
             # 4. Replace the llm argument with:
             #     llm=openai.realtime.RealtimeModel(voice="marin")
             instructions=textwrap.dedent(
-                """\
-                You are a professional Interview Assistant, conducting a structured interview with a candidate. Your goal is to ask questions, listen to the candidate's responses, and provide feedback based on their answers. You will also provide information about the company when asked.
-                The langgraph workflow is set up to handle the interview process, including asking questions, recording answers, and providing company information. You will use the tools provided by the workflow to perform these tasks.
-                Be conversational, polite, and professional. Guide the candidate through the interview process step by step, and ensure they feel comfortable and understood. Use the tools as needed to retrieve information or record responses.
-
+                """
+               "You are a professional interviewer conducting a job interview. "
+               "The LangGraph workflow will drive the conversation flow. "
+                "Simply speak the questions and responses as they come from the graph. "
+                 "Be conversational, professional, and helpful throughout the interview process."
                 # Output rules
 
                 You are interacting with the user via voice, and must apply the following rules to ensure your output sounds natural in a text-to-speech system:
@@ -94,6 +99,8 @@ class Assistant(Agent):
 
 server = AgentServer()
 
+from livekit.agents.voice.avatar import DataStreamAudioOutput
+
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
@@ -101,7 +108,7 @@ def prewarm(proc: JobProcess):
 
 server.setup_fnc = prewarm
 
-lg_llm = langchain.LLMAdapter(graph=create_workflow())
+
 
 @server.rtc_session(agent_name="my-agent")
 async def my_agent(ctx: JobContext):
@@ -111,9 +118,12 @@ async def my_agent(ctx: JobContext):
         "room": ctx.room.name,
     }
 
+    interview_graph = create_workflow()
+    lg_llm = langchain.LLMAdapter(graph=interview_graph)
+
     # Set up a voice AI pipeline using OpenAI, Cartesia, Deepgram, and the LiveKit turn detector
     session = AgentSession(
-          llm=lg_llm,
+        llm=lg_llm,
         # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
         # See all available models at https://docs.livekit.io/agents/models/stt/
         stt=groq.STT(model="whisper-large-v3-turbo", language="en"),
@@ -131,6 +141,15 @@ async def my_agent(ctx: JobContext):
         preemptive_generation=True,
     )
 
+    avatar = simli.AvatarSession(
+      simli_config=simli.SimliConfig(
+         api_key=os.getenv("SIMLI_API_KEY"),
+         face_id="6926a39d-638b-49c5-9328-79efa034e9a4",  # ID of the Simli face to use for your avatar. See "Face setup" for details.
+      ),
+   )
+    
+    await avatar.start(session, room=ctx.room) 
+
     # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
         agent=Assistant(),
@@ -143,6 +162,8 @@ async def my_agent(ctx: JobContext):
             ),
         ),
     )
+
+
 
     # # Add a virtual avatar to the session, if desired
     # # For other providers, see https://docs.livekit.io/agents/models/avatar/
@@ -161,3 +182,5 @@ async def my_agent(ctx: JobContext):
 
 if __name__ == "__main__":
     cli.run_app(server)
+
+

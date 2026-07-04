@@ -6,22 +6,32 @@ from operator import add as add_messages
 
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, ToolMessage, AIMessage
-from langchain_google_genai import GoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_groq import ChatGroq
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_core.tools import tool
-from livekit.agents import AgentSession
-from livekit.plugins import langchain
+from pydantic import BaseModel, Field
 
 load_dotenv(".env.local")
 
 # -------------------- Build your Interview RAG pipeline --------------------
 def create_workflow():
-    llm = GoogleGenerativeAI(model="google/gemini-2.5-flash", temperature=0.7)
-    embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2-preview")
+    llm = ChatGroq(
+    model="qwen/qwen3-32b",
+    temperature=0,
+    max_tokens=None,
+    reasoning_format="parsed",
+    timeout=None,
+    max_retries=2
+    )
 
-    pdf_path = "Users/menah/Downloads/Pinwheel_Robotics_Company_Profile.pdf"
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
+
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    pdf_path = os.path.join(base_dir, "Pinwheel_Robotics_Company_Profile.pdf")
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF file not found: {pdf_path}. Please set COMPANY_PDF_PATH environment variable or place TechCompanyInfo.pdf in the current directory.")
 
@@ -76,6 +86,33 @@ def create_workflow():
     class InterviewState(TypedDict):
         messages: Annotated[Sequence[BaseMessage], add_messages]
 
+    class STARRRating(BaseModel):
+        Situation: int = Field(description="1-10 rating of the situation described by the candidate")
+        Task: int = Field(description="1-10 rating of the task described by the candidate")
+        Action: int = Field(description="1-10 rating of the action described by the candidate")
+        Result: int = Field(description="1-10 rating of the result described by the candidate")
+        Reflection: int = Field(description="1-10 rating of the reflection described by the candidate")
+        Feedback: str = Field(description="Constructive feedback based on the candidate's responses")
+
+    def get_starr_rating(state: InterviewState) -> InterviewState: 
+        """Get a STARR rating based on the candidate's responses."""
+        scorer = llm.with_structured_output(STARRRating)
+        starr_rating = scorer.invoke(state["messages"])
+
+        text = (
+        f"STARR Breakdown:\n"
+        f"Situation: {starr_rating.Situation}/10\n"
+        f"Task: {starr_rating.Task}/10\n"
+        f"Action: {starr_rating.Action}/10\n"
+        f"Result: {starr_rating.Result}/10\n\n"
+        f"Reflection: {starr_rating.Reflection}/10\n"
+        f"Feedback: {starr_rating.Feedback}"
+    )
+
+        message = AIMessage(content=text)
+        return {"messages": [message]}
+
+
     def decide_next_action(state: InterviewState) -> str:
         """Decide what to do next: tool_executor or end"""
         last = state["messages"][-1]
@@ -84,26 +121,28 @@ def create_workflow():
         if hasattr(last, "tool_calls") and last.tool_calls and len(last.tool_calls) > 0:
             return "tool_executor"
         
+        content = last.content if isinstance(last.content, str) else last.content[0].get("text", "")
+        if "interview completed" in content.lower():
+             return "starr"
+        
+        
         # Default to end if no specific action needed
         return "end"
 
     def call_llm(state: InterviewState) -> InterviewState:
         """Main LLM call that handles the interview conversation."""
         system_prompt = (
-            "You are a professional interviewer conducting a job interview. "
+            "You are a professional interviewer conducting a job interview. By the end of the interview if there is no more question left you will say 'Interview completed I will now provide a STARR rating based on the candidate's responses.' and then go to starr"
             "You will ask structured questions in this order:\n"
             "1. First: 'Hello! Thank you for joining us today. Let's start with the basics - could you tell me about yourself? Please share your background, what you're passionate about, and what brings you here today.'\n"
-            "2. After they respond: 'That's great to hear! Now, I'd love to learn about you in more detail. Could you tell me about your experience? What relevant projects have you worked with?'\n"
-            "3. After they respond: 'Excellent! Now, I'd like to hear about a time when you faced a significant challenge, either personal or professional. Could you walk me through the situation, what obstacles you encountered, and how you overcame them? What did you learn from that experience?'\n"
-            "4. After they respond: 'Thank you for sharing that with me. Now, I'd like to give you a rating of your performance in this interview based on the STARR structure.'\n\n"
-            "- Please provide a rating from 1 to 5, where 1 is 'Needs Improvement' and 5 is 'Excellent'. Also, provide a brief explanation for your rating based on the candidate's responses to the questions asked. Provide constructive feedback.\n"
-            "5. After they respond: 'Thank you for your time. Now, I'd like to give you the opportunity to ask me anything about our company, the role, or anything else you'd like to know. What questions do you have for me?'\n\n"
+            "2. After they respond: 'That's great to hear! Now, I'd love to learn about your technical background. Could you tell me about your experience with technology? What technologies, programming languages, or technical projects have you worked with?'\n"
+            "3. After they respond: 'Excellent! Now, I'd like to hear about a time when you faced a significant challenge, either technical or professional. Could you walk me through the situation, what obstacles you encountered, and how you overcame them? What did you learn from that experience?'\n"
+            "4. After they respond: 'Thank you for sharing that with me. Now, I'd like to give you the opportunity to ask me anything about our company, the role, or anything else you'd like to know. What questions do you have for me?'\n\n"
             "IMPORTANT ROUTING RULES:\n"
             "- When the candidate asks questions about the company (mission, culture, revenue, etc.), use the company_info_tool to find relevant information\n"
             "- When the candidate gives answers to your interview questions, use the record_answer_tool to record their response, then acknowledge it and ask the next question\n"
             "- Be conversational, professional, and helpful\n"
             "- If you don't have specific company information, say so honestly and offer to connect them with someone who might know more"
-            
         )
         
         msgs = [SystemMessage(content=system_prompt)] + list(state["messages"])
@@ -149,6 +188,7 @@ def create_workflow():
     # Add nodes
     graph.add_node("llm", call_llm)
     graph.add_node("tool_executor", tool_executor)
+    graph.add_node("starr", get_starr_rating)
     
     # Set up the flow
     graph.set_entry_point("llm")
@@ -159,11 +199,12 @@ def create_workflow():
         decide_next_action, 
         {
             "tool_executor": "tool_executor",
-            "end": END
+            "starr": "starr"
         }
     )
     
     # From tool_executor back to LLM
     graph.add_edge("tool_executor", "llm")
+    graph.add_edge("starr", END)
 
     return graph.compile()
